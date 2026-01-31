@@ -48,7 +48,7 @@ GITHUB_API="${GITHUB_API:-https://api.github.com}"
 DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"                       # 默认分支名称
 REPO_PREFIX="${REPO_PREFIX:-}"                                # 仓库名称前缀 (可选)
 REPO_SUFFIX="${REPO_SUFFIX:-}"                                # 仓库名称后缀 (可选)
-USE_DATE_SUFFIX="${USE_DATE_SUFFIX:-false}"                     # 是否使用日期作为后缀 (true/false)
+
 REPO_DESCRIPTION="${REPO_DESCRIPTION:-Auto-created repository}" # 仓库描述
 
 # 是否私有仓库
@@ -345,7 +345,6 @@ process_folder() {
         log_warning "仓库已存在: $repo_name"
         log_info "尝试添加日期后缀..."
 
-        # 如果启用了日期后缀或仓库已存在，则添加日期后缀
         local date_suffix=$(get_current_date)
         local new_repo_name="${repo_name}-${date_suffix}"
 
@@ -356,26 +355,6 @@ process_folder() {
         fi
         
         log_info "使用日期后缀重命名仓库: $repo_name -> $new_repo_name"
-        repo_name="$new_repo_name"
-        
-        # 如果文件夹名称也需要同步更改
-        if [ -d "$folder_name" ] && [ "$folder_name" != "$new_repo_name" ]; then
-            mv "$folder_name" "$new_repo_name"
-            log_success "重命名文件夹: $folder_name -> $new_repo_name"
-            folder_name="$new_repo_name"
-        fi
-    elif [ "$USE_DATE_SUFFIX" = "true" ]; then
-        # 如果启用了日期后缀，始终添加日期后缀
-        local date_suffix=$(get_current_date)
-        local new_repo_name="${repo_name}-${date_suffix}"
-        
-        if check_repo_exists "$new_repo_name"; then
-            log_error "仓库已存在（即使添加日期后缀后）: $new_repo_name"
-            log_error "请手动处理冲突"
-            return 1
-        fi
-        
-        log_info "使用日期后缀（强制模式）重命名仓库: $repo_name -> $new_repo_name"
         repo_name="$new_repo_name"
         
         # 如果文件夹名称也需要同步更改
@@ -450,69 +429,58 @@ main() {
         repo_names+=("$repo_name")
     done
     
-    # 如果启用了日期后缀，则跳过冲突检测
-    if [ "$USE_DATE_SUFFIX" = "true" ]; then
-        log_info "启用日期后缀模式，跳过冲突检测"
-        local date_suffix=$(get_current_date)
-        local new_repo_names=()
+    # 循环检查和处理冲突
+    local max_attempts=10
+    local attempt=0
+    local date_suffix=$(get_current_date)
+
+    while [ $attempt -lt $max_attempts ]; do
+        ((attempt++))
+        log_info ""
+        log_info "=========================================="
+        log_info "第 $attempt 次检查仓库冲突"
+        log_info "=========================================="
+
+        # 检查哪些仓库已存在（只检查当前repo_names列表中的）
+        local existing_repos=()
         for repo_name in "${repo_names[@]}"; do
-            new_repo_names+=("${repo_name}-${date_suffix}")
-        done
-        repo_names=("${new_repo_names[@]}")
-    else
-        # 循环检查和处理冲突
-        local max_attempts=10
-        local attempt=0
-        local date_suffix=$(get_current_date)
-
-        while [ $attempt -lt $max_attempts ]; do
-            ((attempt++))
-            log_info ""
-            log_info "=========================================="
-            log_info "第 $attempt 次检查仓库冲突"
-            log_info "=========================================="
-
-            # 检查哪些仓库已存在（只检查当前repo_names列表中的）
-            local existing_repos=()
-            for repo_name in "${repo_names[@]}"; do
-                if check_repo_exists "$repo_name"; then
-                    existing_repos+=("$repo_name")
-                fi
-            done
-
-            if [ ${#existing_repos[@]} -eq 0 ]; then
-                log_success "没有冲突的仓库"
-                break
+            if check_repo_exists "$repo_name"; then
+                existing_repos+=("$repo_name")
             fi
-
-            if [ $attempt -ge $max_attempts ]; then
-                log_error "超过最大重试次数 ($max_attempts)"
-                log_error "请手动检查以下冲突仓库:"
-                printf '  - %s\n' "${existing_repos[@]}"
-                exit 1
-            fi
-
-            log_warning "发现 ${#existing_repos[@]} 个冲突仓库"
-            log_info "将添加日期后缀并重命名文件夹..."
-
-            # 重命名文件夹（只对冲突的仓库操作）
-            rename_folders "${folders[@]}" "${existing_repos[@]}"
-
-            # 重新获取文件夹列表和仓库名称
-            folders=()
-            repo_names=()
-            for item in */; do
-                if [ -d "$item" ]; then
-                    folder_name=$(basename "$item")
-                    if [[ ! "$folder_name" =~ ^\. ]] && [ "$folder_name" != "提交" ]; then
-                        folders+=("$folder_name")
-                        # 直接使用文件夹名作为仓库名
-                        repo_names+=("$folder_name")
-                    fi
-                fi
-            done
         done
-    fi
+
+        if [ ${#existing_repos[@]} -eq 0 ]; then
+            log_success "没有冲突的仓库"
+            break
+        fi
+
+        if [ $attempt -ge $max_attempts ]; then
+            log_error "超过最大重试次数 ($max_attempts)"
+            log_error "请手动检查以下冲突仓库:"
+            printf '  - %s\n' "${existing_repos[@]}"
+            exit 1
+        fi
+
+        log_warning "发现 ${#existing_repos[@]} 个冲突仓库"
+        log_info "将添加日期后缀并重命名文件夹..."
+
+        # 重命名文件夹（只对冲突的仓库操作）
+        rename_folders "${folders[@]}" "${existing_repos[@]}"
+
+        # 重新获取文件夹列表和仓库名称
+        folders=()
+        repo_names=()
+        for item in */; do
+            if [ -d "$item" ]; then
+                folder_name=$(basename "$item")
+                if [[ ! "$folder_name" =~ ^\. ]] && [ "$folder_name" != "提交" ]; then
+                    folders+=("$folder_name")
+                    # 直接使用文件夹名作为仓库名
+                    repo_names+=("$folder_name")
+                fi
+            fi
+        done
+    done
     
     log_info ""
     log_info "=========================================="
@@ -585,7 +553,7 @@ usage() {
     -b, --branch BRANCH        默认分支名称 (默认: main)
     -p, --prefix PREFIX        仓库名称前缀
     -s, --suffix SUFFIX        仓库名称后缀
-    -d, --date-suffix          使用日期作为后缀
+
     -r, --private              创建私有仓库
     --force                    强制执行，跳过所有确认
     -h, --help                 显示帮助信息
@@ -597,7 +565,7 @@ usage() {
     DEFAULT_BRANCH             默认分支名称 (默认: main)
     REPO_PREFIX                仓库名称前缀
     REPO_SUFFIX                仓库名称后缀
-    USE_DATE_SUFFIX            是否使用日期作为后缀 (true/false)
+
     PRIVATE_REPO               是否私有仓库 (true/false)
     REPO_DESCRIPTION           仓库描述
 
@@ -671,10 +639,7 @@ while [[ $# -gt 0 ]]; do
             REPO_SUFFIX="$2"
             shift 2
             ;;
-        -d|--date-suffix)
-            USE_DATE_SUFFIX=true
-            shift
-            ;;
+
         -r|--private)
             PRIVATE_REPO=true
             shift
