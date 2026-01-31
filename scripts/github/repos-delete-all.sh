@@ -248,7 +248,7 @@ delete_repo() {
         "$repo_url" 2>/dev/null)
     
     # 分离响应体和状态码
-    local response_body=$(echo "$response_and_status" | sed "$ d")
+    local response_body=$(echo "$response_and_status" | sed '$ d')
     local status_code=$(echo "$response_and_status" | tail -n1)
     
     if [ "$status_code" = "204" ] || [ "$status_code" = "404" ]; then
