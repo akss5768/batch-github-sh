@@ -6,13 +6,37 @@
 # 支持：指定目录、跳过已存在、显示进度
 #############################################
 
-# ==================== 加载环境变量 ====================
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# 优先从 .env 文件加载，如果不存在则使用默认值
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    export $(cat "$SCRIPT_DIR/.env" | grep -v '^#' | grep -v '^$' | xargs)
+# ==================== 参数验证 ====================
+if [ $# -lt 2 ]; then
+    echo "错误: 请指定环境变量文件路径和工作目录路径"
+    echo "用法: $0 <env_file_path> <work_directory> [options...]"
+    exit 1
 fi
+
+ENV_FILE_PATH="$1"
+WORK_DIR="$2"
+shift 2
+
+if [ ! -f "$ENV_FILE_PATH" ]; then
+    echo "错误: 环境变量文件 '$ENV_FILE_PATH' 不存在"
+    exit 1
+fi
+
+if [ ! -d "$WORK_DIR" ]; then
+    echo "错误: 工作目录 '$WORK_DIR' 不存在"
+    exit 1
+fi
+
+# 加载环境变量文件
+set -a
+source "$ENV_FILE_PATH" 2>/dev/null || {
+    echo "错误: 无法加载环境变量文件 '$ENV_FILE_PATH'"
+    echo "请确保文件存在且格式正确"
+    exit 1
+}
+set +a
+
+cd "$WORK_DIR" || exit 1
 
 # ==================== 配置变量 ====================
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"                              # GitHub Personal Access Token (必填)
@@ -24,6 +48,9 @@ CLONE_DIR="${CLONE_DIR:-repos}"                              # 检出目录
 SKIP_EXISTING="${SKIP_EXISTING:-true}"                       # 是否跳过已存在的仓库 (true/false)
 CLONE_SSH="${CLONE_SSH:-false}"                              # 是否使用SSH (true/false)
 
+# 脚本行为配置
+FORCE_MODE="${FORCE_MODE:-false}"                             # 是否强制执行，跳过所有确认 (true/false)
+
 # ==================== 颜色输出 ====================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -34,6 +61,8 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # ==================== 函数定义 ====================
+
+
 
 # 打印信息
 log_info() {
@@ -70,11 +99,12 @@ usage() {
 检出所有GitHub仓库脚本
 
 用法:
-    $0 [选项]
+    $0 <env_file_path> <work_directory> [选项]
 
 选项:
     -d, --dir DIRECTORY        检出到指定目录 (默认: repos)
     -f, --force                强制检出已存在的仓库
+    --force                    强制执行，跳过所有确认
     -s, --ssh                  使用SSH协议检出 (默认HTTPS)
     -h, --help                 显示帮助信息
 
@@ -101,7 +131,7 @@ usage() {
        CLONE_DIR=repos
     
     3. 执行脚本
-       ./checkout-all-repos.sh
+       ./repos-checkout-all.sh /path/to/.env /path/to/work/directory
 
 工作流程:
     1. 从GitHub API获取用户的所有仓库列表
@@ -110,26 +140,30 @@ usage() {
     4. 跳过已存在的仓库 (除非使用 --force)
 
 示例:
-    # 使用 .env 文件配置（推荐）
-    $0
+    # 使用指定的 .env 文件和工作目录
+    $0 /path/to/.env /path/to/work/dir
 
     # 指定检出目录
-    $0 -d my-repos
+    $0 /path/to/.env /path/to/work/dir -d my-repos
 
     # 强制检出（覆盖已存在的仓库）
-    $0 -f
+    $0 /path/to/.env /path/to/work/dir -f
 
     # 使用SSH协议检出
-    $0 -s
+    $0 /path/to/.env /path/to/work/dir -s
 
     # 组合使用
-    $0 -d my-repos -f -s
+    $0 /path/to/.env /path/to/work/dir -d my-repos -f -s
+
+    # 强制执行，跳过所有确认
+    $0 /path/to/.env /path/to/work/dir --force
 
 注意:
     - 需要 GitHub Personal Access Token (read:org 或 repo 权限)
     - 默认跳过已存在的仓库，使用 -f 可覆盖
     - 默认使用HTTPS协议，使用 -s 可切换到SSH
     - .env 文件已添加到 .gitignore，不会被提交
+    - 必须指定环境变量文件路径和工作目录路径
 
 获取GitHub Token:
     GitHub -> Settings -> Developer settings -> Personal access tokens -> Tokens (classic)
@@ -177,6 +211,7 @@ get_all_repos() {
         
         # 提取仓库名称和克隆URL
         while IFS= read -r repo_info; do
+            local repo_name=$(echo "$repo_info" | cut -d'|' -f1)
             repos+=("$repo_info")
         done < <(echo "$response" | jq -r '.[] | "\(.name)|\(.clone_url)|\(.ssh_url)|\(.visibility)"' 2>/dev/null)
         
@@ -279,7 +314,13 @@ main() {
                 shift 2
                 ;;
             -f|--force)
+                # 原有功能：强制检出已存在的仓库
                 SKIP_EXISTING=false
+                shift
+                ;;
+            --force)
+                # 新增功能：跳过所有确认
+                FORCE_MODE=true
                 shift
                 ;;
             -s|--ssh)
@@ -329,11 +370,15 @@ main() {
     echo ""
     
     # 确认是否继续
-    read -p "$(echo -e ${BLUE}是否继续检出这些仓库? [y/N]: ${NC})" confirm
-    
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-        log_info "操作已取消"
-        exit 0
+    if [ "$FORCE_MODE" != "true" ]; then
+        read -p "$(echo -e ${BLUE}是否继续检出这些仓库? [y/N]: ${NC})" confirm
+        
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            log_info "操作已取消"
+            exit 0
+        fi
+    else
+        log_info "强制模式：跳过检出确认"
     fi
     
     echo ""
@@ -412,6 +457,18 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     usage
     exit 0
 fi
+
+# 信号处理函数 - 用于清理敏感信息
+cleanup() {
+    log_info "收到中断信号，正在清理..."
+    # 恢复到原始目录
+    cd "$WORK_DIR" 2>/dev/null || cd "$OLDPWD" 2>/dev/null
+    log_info "清理完成"
+    exit 1
+}
+
+# 注册信号处理器
+trap cleanup INT TERM EXIT
 
 # 执行主流程
 main "$@"

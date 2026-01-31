@@ -6,13 +6,37 @@
 # 支持：检查冲突、自动重命名、创建仓库、推送代码
 #############################################
 
-# ==================== 加载环境变量 ====================
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# 优先从 .env 文件加载，如果不存在则使用默认值
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    export $(cat "$SCRIPT_DIR/.env" | grep -v '^#' | grep -v '^$' | xargs)
+# ==================== 参数验证 ====================
+if [ $# -lt 2 ]; then
+    echo "错误: 请指定环境变量文件路径和工作目录路径"
+    echo "用法: $0 <env_file_path> <work_directory> [options...]"
+    exit 1
 fi
+
+ENV_FILE_PATH="$1"
+WORK_DIR="$2"
+shift 2
+
+if [ ! -f "$ENV_FILE_PATH" ]; then
+    echo "错误: 环境变量文件 '$ENV_FILE_PATH' 不存在"
+    exit 1
+fi
+
+if [ ! -d "$WORK_DIR" ]; then
+    echo "错误: 工作目录 '$WORK_DIR' 不存在"
+    exit 1
+fi
+
+# 加载环境变量文件
+set -a
+source "$ENV_FILE_PATH" 2>/dev/null || {
+    echo "错误: 无法加载环境变量文件 '$ENV_FILE_PATH'"
+    echo "请确保文件存在且格式正确"
+    exit 1
+}
+set +a
+
+cd "$WORK_DIR" || exit 1
 
 # ==================== 配置变量 ====================
 # GitHub API配置
@@ -30,6 +54,9 @@ REPO_DESCRIPTION="${REPO_DESCRIPTION:-Auto-created repository}" # 仓库描述
 # 是否私有仓库
 PRIVATE_REPO="${PRIVATE_REPO:-false}"                         # true: 私有, false: 公开
 
+# 脚本行为配置
+FORCE_MODE="${FORCE_MODE:-false}"                             # 是否强制执行，跳过所有确认 (true/false)
+
 # ==================== 颜色输出 ====================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,6 +65,8 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # ==================== 函数定义 ====================
+
+
 
 # 打印信息
 log_info() {
@@ -100,13 +129,13 @@ get_current_date() {
 check_repo_exists() {
     local repo_name="$1"
     
-    local response=$(curl -s -w "\n%{http_code}" \
+    local response=$(curl -s -w "%{http_code}" \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
         "$GITHUB_API/repos/$GITHUB_USERNAME/$repo_name" 2>/dev/null)
     
-    local status_code=$(echo "$response" | tail -n1)
-    local body=$(echo "$response" | sed '$d')
+    local status_code="$response"
+    local body=""
     
     if [ "$status_code" = "200" ]; then
         return 0  # 存在
@@ -161,11 +190,16 @@ init_git_repo() {
 
     # 初始化仓库
     if [ ! -d ".git" ]; then
+        log_info "正在初始化Git仓库..."
         git init
+        log_info "正在创建并切换到分支: $branch"
         git branch -M "$branch"
+    else
+        log_info "Git仓库已存在，跳过初始化"
     fi
 
     # 添加所有文件
+    log_info "正在添加所有文件..."
     git add .
 
     # 检查是否有改动
@@ -179,11 +213,15 @@ init_git_repo() {
             log_info "创建默认 README.md 文件用于提交"
         else
             # 添加未追踪的文件
+            log_info "添加未追踪的文件..."
             git add .
         fi
+    else
+        log_info "检测到文件更改，准备提交"
     fi
 
     # 提交
+    log_info "正在提交更改..."
     git commit -m "Initial commit"
 
     # 恢复原始目录
@@ -207,7 +245,7 @@ create_github_repo() {
         private_flag="true"
     fi
     
-    local response=$(curl -s -w "\n%{http_code}" \
+    local response=$(curl -s -w "%{http_code}" \
         -X POST \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
@@ -220,14 +258,13 @@ create_github_repo() {
             \"default_branch\": \"$DEFAULT_BRANCH\"
         }" 2>/dev/null)
     
-    local status_code=$(echo "$response" | tail -n1)
+    local status_code="$response"
     
     if [ "$status_code" = "201" ]; then
         log_success "仓库创建成功: $repo_name"
         return 0
     else
         log_error "仓库创建失败: $repo_name (状态码: $status_code)"
-        echo "$response" | sed '$d' | jq -r '.message' 2>/dev/null || echo "$response" | sed '$d'
         return 1
     fi
 }
@@ -245,7 +282,7 @@ push_to_github() {
 
     cd "$folder_path" || return 1
 
-    # 使用HTTPS URL（使用token进行认证）
+    # 使用包含认证信息的HTTPS URL
     local repo_url="https://${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${repo_name}.git"
 
     # 添加远程仓库
@@ -255,13 +292,17 @@ push_to_github() {
         git remote add origin "$repo_url"
     fi
 
-    # 推送
-    if git push -u origin "$branch" &>/dev/null; then
-        log_success "推送成功: $repo_name"
+    log_info "正在推送代码: $repo_name (分支: $branch)"
+    
+    # 显示推送过程中的详细输出
+    if git push -u origin "$branch" 2>&1; then
+        log_success "推送成功: $repo_name (分支: $branch)"
+        # 推送成功后，将远程URL改回不包含token的形式以增加安全性
+        git remote set-url origin "https://github.com/${GITHUB_USERNAME}/${repo_name}.git"
         cd "$current_dir"
         return 0
     else
-        log_error "推送失败: $repo_name"
+        log_error "推送失败: $repo_name (分支: $branch)"
         cd "$current_dir"
         return 1
     fi
@@ -323,20 +364,28 @@ process_folder() {
     fi
 
     # 初始化Git仓库
+    log_info "初始化Git仓库: $folder_name (分支: $DEFAULT_BRANCH)"
     if ! init_git_repo "$folder_name" "$DEFAULT_BRANCH"; then
-        log_warning "跳过: $folder_name"
+        log_warning "初始化Git仓库失败，跳过: $folder_name"
         return 1
     fi
+    log_info "Git仓库初始化完成: $folder_name"
 
     # 创建GitHub仓库
+    log_info "创建远程仓库: $repo_name"
     if ! create_github_repo "$repo_name"; then
+        log_error "创建远程仓库失败: $repo_name"
         return 1
     fi
+    log_info "远程仓库创建完成: $repo_name"
 
     # 推送代码
+    log_info "开始推送仓库: $repo_name"
     if ! push_to_github "$folder_name" "$repo_name" "$DEFAULT_BRANCH"; then
+        log_error "仓库推送失败: $repo_name"
         return 1
     fi
+    log_info "仓库推送完成: $repo_name"
 
     log_success "✓ 完成: $repo_name"
     return 0
@@ -449,11 +498,15 @@ main() {
     log_info "=========================================="
     
     # 确认是否继续
-    echo ""
-    read -p "是否继续创建这些仓库? (y/n): " confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-        log_info "操作已取消"
-        exit 0
+    if [ "$FORCE_MODE" != "true" ]; then
+        echo ""
+        read -p "是否继续创建这些仓库? (y/n): " confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            log_info "操作已取消"
+            exit 0
+        fi
+    else
+        log_info "强制模式：跳过创建确认"
     fi
     
     # 批量创建和推送
@@ -471,12 +524,14 @@ main() {
         local repo="${repo_names[$i]}"
         local progress=$((i + 1))
 
-        printf "${BLUE}进度:${NC} [%3d/%3d] 处理: ${MAGENTA}%s${NC}\n" "$progress" "$total" "$folder"
+        log_info "处理仓库 [$progress/$total]: $folder -> $repo"
 
         if process_folder "$folder" "$repo"; then
             ((success_count++))
+            log_success "仓库处理成功: $repo"
         else
             ((fail_count++))
+            log_error "仓库处理失败: $repo"
         fi
         echo ""
     done
@@ -499,7 +554,7 @@ usage() {
 批量创建GitHub仓库脚本
 
 用法:
-    $0 [选项]
+    $0 <env_file_path> <work_directory> [选项]
 
 选项:
     -u, --username USERNAME    GitHub用户名
@@ -509,6 +564,7 @@ usage() {
     -s, --suffix SUFFIX        仓库名称后缀
     -d, --date-suffix          使用日期作为后缀
     -r, --private              创建私有仓库
+    --force                    强制执行，跳过所有确认
     -h, --help                 显示帮助信息
 
 环境变量 (通过 .env 文件配置):
@@ -536,26 +592,30 @@ usage() {
        GITHUB_USERNAME=your_username_here
     
     3. 执行脚本
-       ./batch-create-repos.sh
+       ./local-push-all.sh /path/to/.env /path/to/work/directory
 
 示例:
-    # 使用 .env 文件配置
-    $0
+    # 使用指定的 .env 文件和工作目录
+    $0 /path/to/.env /path/to/work/dir
 
     # 使用命令行参数
-    $0 -u yourname -t your_token -d
+    $0 /path/to/.env /path/to/work/dir -u yourname -t your_token -d
 
     # 指定前缀和后缀
-    $0 -p myapp- -s -demo
+    $0 /path/to/.env /path/to/work/dir -p myapp- -s -demo
 
     # 创建私有仓库
-    $0 -r
+    $0 /path/to/.env /path/to/work/dir -r
+
+    # 强制执行，跳过所有确认
+    $0 /path/to/.env /path/to/work/dir --force
 
 注意:
     - 需要安装: curl, git, jq
     - 需要配置 GitHub Personal Access Token (repo 权限)
     - .env 文件已添加到 .gitignore，不会被提交
     - 首次使用请先配置 .env 文件
+    - 必须指定环境变量文件路径和工作目录路径
 EOF
 }
 
@@ -596,6 +656,10 @@ while [[ $# -gt 0 ]]; do
             PRIVATE_REPO=true
             shift
             ;;
+        --force)
+            FORCE_MODE=true
+            shift
+            ;;
         *)
             log_error "未知选项: $1"
             usage
@@ -603,6 +667,29 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# 信号处理函数 - 用于清理敏感信息
+cleanup() {
+    log_info "收到中断信号，正在清理..."
+    # 恢复到原始目录
+    cd "$WORK_DIR" 2>/dev/null || cd "$OLDPWD" 2>/dev/null
+    
+    # 尝试清理可能的凭证配置
+    local current_dir=$(pwd)
+    for dir in */; do
+        if [ -d "$dir/.git" ]; then
+            cd "$dir" &>/dev/null
+            git config --unset http.extraheader 2>/dev/null || true
+            cd "$current_dir" &>/dev/null
+        fi
+    done
+    
+    log_info "清理完成"
+    exit 1
+}
+
+# 注册信号处理器
+trap cleanup INT TERM EXIT
 
 # 检查必需命令
 check_requirements

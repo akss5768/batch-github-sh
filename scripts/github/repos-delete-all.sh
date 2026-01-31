@@ -7,18 +7,45 @@
 # 选项：--force 跳过确认直接删除
 #############################################
 
-# ==================== 加载环境变量 ====================
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# 优先从 .env 文件加载，如果不存在则使用默认值
-if [ -f "$SCRIPT_DIR/.env" ]; then
-    export $(cat "$SCRIPT_DIR/.env" | grep -v '^#' | grep -v '^$' | xargs)
+# ==================== 参数验证 ====================
+if [ $# -lt 2 ]; then
+    echo "错误: 请指定环境变量文件路径和工作目录路径"
+    echo "用法: $0 <env_file_path> <work_directory> [options...]"
+    exit 1
 fi
+
+ENV_FILE_PATH="$1"
+WORK_DIR="$2"
+shift 2
+
+if [ ! -f "$ENV_FILE_PATH" ]; then
+    echo "错误: 环境变量文件 '$ENV_FILE_PATH' 不存在"
+    exit 1
+fi
+
+if [ ! -d "$WORK_DIR" ]; then
+    echo "错误: 工作目录 '$WORK_DIR' 不存在"
+    exit 1
+fi
+
+# 加载环境变量文件
+set -a
+source "$ENV_FILE_PATH" 2>/dev/null || {
+    echo "错误: 无法加载环境变量文件 '$ENV_FILE_PATH'"
+    echo "请确保文件存在且格式正确"
+    exit 1
+}
+set +a
+
+cd "$WORK_DIR" || exit 1
 
 # ==================== 配置变量 ====================
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"                              # GitHub Personal Access Token (必填)
 GITHUB_USERNAME="${GITHUB_USERNAME:-}"                        # GitHub用户名 (必填)
 GITHUB_API="${GITHUB_API:-https://api.github.com}"
+
+# 脚本行为配置
+FORCE_MODE="${FORCE_MODE:-false}"                             # 是否强制执行，跳过所有确认 (true/false)
 
 # ==================== 颜色输出 ====================
 RED='\033[0;31m'
@@ -30,6 +57,8 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # ==================== 函数定义 ====================
+
+
 
 # 打印信息
 log_info() {
@@ -68,10 +97,11 @@ usage() {
 ⚠️  警告：此操作不可逆，请谨慎使用！
 
 用法:
-    $0 [选项]
+    $0 <env_file_path> <work_directory> [选项]
 
 选项:
     -f, --force              强制删除，跳过所有确认（危险操作）
+    --force                  强制执行，跳过所有确认（危险操作）
     -h, --help               显示帮助信息
 
 环境变量 (通过 .env 文件配置):
@@ -93,7 +123,7 @@ usage() {
        GITHUB_USERNAME=your_username_here
     
     3. 执行脚本
-       ./delete-all-repos.sh
+       ./repos-delete-all.sh /path/to/.env /path/to/work/directory
 
 安全机制:
     默认情况下，脚本会要求进行三次确认：
@@ -102,14 +132,17 @@ usage() {
     3. 第三次：输入 'YES' 最终确认删除
 
 示例:
-    # 使用 .env 文件配置（推荐）
-    $0
+    # 使用指定的 .env 文件和工作目录
+    $0 /path/to/.env /path/to/work/dir
 
     # 强制模式（跳过确认）
-    $0 --force
+    $0 /path/to/.env /path/to/work/dir --force
 
     # 强制模式（短选项）
-    $0 -f
+    $0 /path/to/.env /path/to/work/dir -f
+
+    # 强制执行，跳过所有确认
+    $0 /path/to/.env /path/to/work/dir --force
 
 注意:
     - 需要 GitHub Personal Access Token (delete_repo 权限)
@@ -117,6 +150,7 @@ usage() {
     - 请确保你有足够的权限删除这些仓库
     - 建议先备份重要仓库
     - .env 文件已添加到 .gitignore，不会被提交
+    - 必须指定环境变量文件路径和工作目录路径
 
 获取GitHub Token:
     GitHub -> Settings -> Developer settings -> Personal access tokens -> Tokens (classic)
@@ -143,8 +177,6 @@ check_config() {
 
 # 获取所有仓库列表
 get_all_repos() {
-    log_info "正在获取仓库列表..."
-    
     local repos=()
     local page=1
     local per_page=100
@@ -164,7 +196,9 @@ get_all_repos() {
         
         # 提取仓库名称
         while IFS= read -r repo_name; do
-            repos+=("$repo_name")
+            if [ -n "$repo_name" ] && [ "$repo_name" != "null" ]; then
+                repos+=("$repo_name")
+            fi
         done < <(echo "$response" | jq -r '.[].name' 2>/dev/null)
         
         ((page++))
@@ -207,13 +241,13 @@ delete_repo() {
     local repo_name="$1"
     local repo_url="$GITHUB_API/repos/$GITHUB_USERNAME/$repo_name"
     
-    local response=$(curl -s -w "\n%{http_code}" \
+    local response=$(curl -s -w "%{http_code}" \
         -X DELETE \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "$repo_url" 2>/dev/null)
+        "$repo_url" 2>/dev/null 1>/dev/null)
     
-    local status_code=$(echo "$response" | tail -n1)
+    local status_code="$response"
     
     if [ "$status_code" = "204" ]; then
         return 0
@@ -309,6 +343,10 @@ main() {
                 force_mode=true
                 shift
                 ;;
+            --force)
+                FORCE_MODE=true
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -322,8 +360,12 @@ main() {
     done
     
     # 强制模式警告
-    if [ "$force_mode" = true ]; then
-        print_warning "正在使用强制模式 (--force)"
+    if [ "$force_mode" = true ] || [ "$FORCE_MODE" = true ]; then
+        if [ "$FORCE_MODE" = true ]; then
+            print_warning "正在使用强制模式 (--force-all)"
+        else
+            print_warning "正在使用强制模式 (--force)"
+        fi
         log_warning "这将跳过所有确认直接删除所有仓库"
         log_info "按 Ctrl+C 立即取消"
         echo ""
@@ -348,10 +390,14 @@ main() {
     display_repos "${repos[@]}"
     
     # 确认步骤（如果不是强制模式）
-    if [ "$force_mode" = false ]; then
+    if [ "$force_mode" = false ] && [ "$FORCE_MODE" = false ]; then
         confirm_step_1 "${repos[@]}"
         confirm_step_2
         confirm_step_3
+    else
+        if [ "$FORCE_MODE" = true ]; then
+            log_info "强制模式：跳过所有确认步骤"
+        fi
     fi
     
     # 开始删除
@@ -367,15 +413,16 @@ main() {
         local progress=$((i + 1))
         local total=${#repos[@]}
         
-        printf "\r${BLUE}进度:${NC} [%3d/%3d] 正在删除: ${MAGENTA}%s${NC}  " "$progress" "$total" "$repo"
+        printf "${BLUE}进度:${NC} [%3d/%3d] 正在删除: ${MAGENTA}%s${NC}\n" "$progress" "$total" "$repo"
         
-        if delete_repo "$repo"; then
+        # 保存当前光标位置并在新的一行列出操作结果，避免覆盖和混合输出
+        if delete_repo "$repo" 2>/dev/null; then
             ((success_count++))
-            printf "\r${GREEN}✓${NC} 进度: [%3d/%3d] 已删除: ${MAGENTA}%s${NC}\n" "$progress" "$total" "$repo"
+            printf "\n${GREEN}✓${NC} 进度: [%3d/%3d] 已删除: ${MAGENTA}%s${NC}\n" "$progress" "$total" "$repo"
         else
             ((fail_count++))
             failed_repos+=("$repo")
-            printf "\r${RED}✗${NC} 进度: [%3d/%3d] 失败: ${MAGENTA}%s${NC}\n" "$progress" "$total" "$repo"
+            printf "\n${RED}✗${NC} 进度: [%3d/%3d] 失败: ${MAGENTA}%s${NC}\n" "$progress" "$total" "$repo"
         fi
     done
     
@@ -416,6 +463,18 @@ if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
     usage
     exit 0
 fi
+
+# 信号处理函数 - 用于清理敏感信息
+cleanup() {
+    log_info "收到中断信号，正在清理..."
+    # 恢复到原始目录
+    cd "$WORK_DIR" 2>/dev/null || cd "$OLDPWD" 2>/dev/null
+    log_info "清理完成"
+    exit 1
+}
+
+# 注册信号处理器
+trap cleanup INT TERM EXIT
 
 # 执行主流程
 main "$@"
