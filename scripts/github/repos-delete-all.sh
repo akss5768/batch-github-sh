@@ -241,15 +241,18 @@ delete_repo() {
     local repo_name="$1"
     local repo_url="$GITHUB_API/repos/$GITHUB_USERNAME/$repo_name"
     
-    local response=$(curl -s -w "%{http_code}" \
+    local response_and_status=$(curl -s -w "\n%{http_code}" \
         -X DELETE \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "$repo_url" 2>/dev/null 1>/dev/null)
+        "$repo_url" 2>/dev/null)
     
-    local status_code="$response"
+    # 分离响应体和状态码
+    local response_body=$(echo "$response_and_status" | sed "$ d")
+    local status_code=$(echo "$response_and_status" | tail -n1)
     
-    if [ "$status_code" = "204" ]; then
+    if [ "$status_code" = "204" ] || [ "$status_code" = "404" ]; then
+        # 204表示删除成功，404表示仓库已不存在（也可以认为是删除成功）
         return 0
     else
         return 1

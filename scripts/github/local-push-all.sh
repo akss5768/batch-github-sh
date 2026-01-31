@@ -245,7 +245,7 @@ create_github_repo() {
         private_flag="true"
     fi
     
-    local response=$(curl -s -w "%{http_code}" \
+    local response_and_status=$(curl -s -w "\n%{http_code}" \
         -X POST \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
@@ -258,13 +258,26 @@ create_github_repo() {
             \"default_branch\": \"$DEFAULT_BRANCH\"
         }" 2>/dev/null)
     
-    local status_code="$response"
+    # 分离响应体和状态码
+    local response_body=$(echo "$response_and_status" | sed "$ d")
+    local status_code=$(echo "$response_and_status" | tail -n1)
     
     if [ "$status_code" = "201" ]; then
         log_success "仓库创建成功: $repo_name"
         return 0
+    elif [ "$status_code" = "422" ]; then
+        # 检查是否是因为仓库已存在导致的422错误
+        if echo "$response_body" | grep -q "already exists"; then
+            log_warning "仓库已存在: $repo_name"
+            return 0  # 返回0表示继续处理，因为仓库已经存在
+        else
+            log_error "仓库创建失败: $repo_name (状态码: $status_code)"
+            echo "$response_body" >&2
+            return 1
+        fi
     else
         log_error "仓库创建失败: $repo_name (状态码: $status_code)"
+        echo "$response_body" >&2
         return 1
     fi
 }
@@ -302,9 +315,19 @@ push_to_github() {
         cd "$current_dir"
         return 0
     else
-        log_error "推送失败: $repo_name (分支: $branch)"
-        cd "$current_dir"
-        return 1
+        # 检查是否是由于仓库已存在但内容冲突导致的推送失败
+        log_warning "推送失败，尝试强制推送: $repo_name (分支: $branch)"
+        if git push -u origin "$branch" --force 2>&1; then
+            log_success "强制推送成功: $repo_name (分支: $branch)"
+            # 推送成功后，将远程URL改回不包含token的形式以增加安全性
+            git remote set-url origin "https://github.com/${GITHUB_USERNAME}/${repo_name}.git"
+            cd "$current_dir"
+            return 0
+        else
+            log_error "推送失败: $repo_name (分支: $branch)"
+            cd "$current_dir"
+            return 1
+        fi
     fi
 }
 
